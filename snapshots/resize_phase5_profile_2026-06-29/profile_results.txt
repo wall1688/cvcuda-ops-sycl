@@ -1,0 +1,21 @@
+Intel Arc [0xb080], opencl:gpu, SYCL event profiling, best-of-20
+
+[F32 C1 downscale 1920x1080 -> 960x540]
+  NEAREST 0.1024 ms  5.06 Gpix/s  40.5 GB/s
+  LINEAR  0.1109 ms  4.67 Gpix/s  93.5 GB/s
+  CUBIC   0.1140 ms  4.55 Gpix/s  309.3 GB/s
+  AREA    0.1148 ms  4.52 Gpix/s  90.3 GB/s
+
+[F32 C1 upscale 1920x1080 -> 3840x2160]
+  NEAREST 0.3232 ms  25.66 Gpix/s  205.3 GB/s
+  LINEAR  0.3501 ms  23.69 Gpix/s  473.8 GB/s
+  CUBIC   0.5017 ms  16.53 Gpix/s  1124.3 GB/s
+
+[U8 C3 downscale 1920x1080 -> 960x540]
+  NEAREST 0.1155 ms  4.49 Gpix/s  26.9 GB/s
+  LINEAR  0.1510 ms  3.43 Gpix/s  51.5 GB/s
+  AREA    0.1426 ms  3.64 Gpix/s  54.5 GB/s
+
+[U8 C3 upscale 1920x1080 -> 3840x2160]
+  NEAREST 1.2767 ms  6.50 Gpix/s  39.0 GB/s
+  LINEAR  3.2672 ms  2.54 Gpix/s  38.1 GB/s   <-- 异常慢, 2.5x slower than NEAREST

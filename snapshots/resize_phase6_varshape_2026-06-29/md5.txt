@@ -1,0 +1,10 @@
+0465dde8518cf4fafec57d587d9f2714  ./common/saturate_cast.hpp
+171e77c77f24a4eb0382fa38add05031  ./common/math_ops.hpp
+28bac11a44c2ae27224bf5e285074bdb  ./test/test_resize.cpp
+33b086fecdf2800886c84a1f8185163d  ./build.sh
+9232164ada9c8954f4348241221395cf  ./resize_varshape.hpp
+a20c6835e6a88a65960849eff9b02407  ./common/tensorwrap.hpp
+ade97234c1fb8096a015db339b1b8cd6  ./test/test_resize_varshape.cpp
+b6e1dbd4b04afef90ff75e71e36329a2  ./test/test_resize_profile.cpp
+d4abcdd7847070ad25c375d2d1960fa2  ./resize.hpp
+d97e07a9e0cff6e9c703787b8f60ec8a  ./common/varshape.hpp

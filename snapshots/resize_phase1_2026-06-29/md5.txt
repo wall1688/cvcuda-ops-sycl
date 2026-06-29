@@ -1,0 +1,8 @@
+171e77c77f24a4eb0382fa38add05031  ./common/math_ops.hpp
+2c59cb0f347097fdfe7ded453108b305  ./test/test_resize.cpp
+590f89b9858f9724cf968f1fe4f6f37a  ./resize.hpp
+73e144874e8e5ab94be59bc9e9ef57d3  ./resize.cpp
+cbc45b5d778bf3bc514c8185e0659d42  ./build.sh
+d41d8cd98f00b204e9800998ecf8427e  ./md5.txt
+efd67a47c3cbd3e1c023f1eb7eee1e19  ./common/tensorwrap.hpp
+f6a7cc3e1056395edc105d1c8152191b  ./common/saturate_cast.hpp

@@ -1,0 +1,11 @@
+# 编译产物 (二进制无扩展名, 不会误伤 .cpp 源码)
+test/test_resize
+test/test_resize_profile
+test/test_resize_varshape
+*.o
+*.so
+*.a
+
+# 编辑器/系统
+*.swp
+.DS_Store

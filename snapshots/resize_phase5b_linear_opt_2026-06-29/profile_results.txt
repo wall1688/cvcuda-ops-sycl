@@ -1,0 +1,17 @@
+LINEAR NIX+INTERSECT 优化后 (Intel Arc [0xb080], best-of-20)
+对比 phase5 基线:
+
+F32 C1 upscale 4K LINEAR:  0.350 -> 0.358 ms  (持平, F32 门控 NIX=1)
+U8 C3 upscale 4K LINEAR:   3.267 -> 1.790 ms  (1.83x 加速)
+U8 C3 downscale LINEAR:    0.151 -> 0.103 ms  (1.47x 加速, 反超 NEAREST)
+U8 C1 upscale 4K LINEAR:   0.346 ms / 24.0 Gpix/s  (NIX=16, 新测)
+
+完整 profile:
+[F32 C1 downscale ->960x540]  NEAR 0.114 / LIN 0.125 / CUB 0.122 / AREA 0.123 ms
+[F32 C1 upscale ->3840x2160]  NEAR 0.323 / LIN 0.358 / CUB 0.502 ms
+[U8 C3 downscale ->960x540]   NEAR 0.115 / LIN 0.103 / AREA 0.143 ms
+[U8 C3 upscale ->3840x2160]   NEAR 1.279 / LIN 1.790 ms
+[U8 C1 upscale ->3840x2160]   NEAR 0.293 / LIN 0.346 ms
+
+正确性: 25 用例全 PASS (优化保持 bit-一致, U8 LINEAR 容差 ±1 内)
+优化: LINEAR 移植 CUDA NIX+INTERSECT 读复用; kNIX 门控(sizeof(T)==1 才开, F32 走 NIX=1 简单路径避免并行度损失)

@@ -1,0 +1,273 @@
+# CV-CUDA Resize 算子移植 — 工作上下文记录
+
+> 记录时间：2026-06-29
+> 任务：把 NVIDIA CV-CUDA 0.16.0 的 Resize 算子（CUDA）移植到 Intel SYCL，在 Intel Arc [0xb080] GPU 上跑通、验证、优化。
+> 这是 cvcuda 算子移植系列的第 1 个算子（体素化算子已完成，见 `lidar-voxelization/claude_task_vaxelizer`）。
+> 严格约束：**Intel 侧只在 `/work/bevfusion_migration/cvcuda_ops/` 内工作；本机在 `cvcuda-ops-sycl/OpResize/` 内工作。** 不动其它目录。
+> 环境拓扑、连接方式、Intel 机 oneAPI/Level Zero/opencl 后端等**通用环境信息见 `claude_task_vaxelizer` §1**（本机 VM 无 GPU，编译+运行必须 ssh 到 Intel 机；`ONEAPI_DEVICE_SELECTOR=opencl:gpu` 强制；宿主机 icpx 编译）。
+
+---
+
+## 0. 移植路线（6 个 phase，全完成）
+
+1. **phase1**：F32 单通道(C=1) NHWC，NEAREST + LINEAR，最小 NHWC tensor wrapper + SaturateCast 空壳 + 合成小图正确性测试 ✅
+2. **phase2**：模板化 `<T,C>`，加 U8 + 多通道(C=1/3/4)，SaturateCast 做实 U8 ✅
+3. **phase3**：加 Cubic 插值（双三次，4×4，A=-0.75）✅
+4. **phase4**：加 Area 插值（盒均值，移植 InterpolationWrap AREA）✅
+5. **phase5**：性能 profiling（SYCL event，best-of-20，大图基线）✅
+   - **phase5b**：LINEAR NIX+INTERSECT 读复用优化（U8 C3 1.83×）✅
+6. **phase6**：var-shape 变尺寸（每图自带 W/H，NN/LINEAR/CUBIC）✅
+
+**当前状态：resize 算子移植主体全部完成，36 用例全 PASS（25 固定尺寸 + 11 var-shape）。**
+
+---
+
+## 1. CV-CUDA 源码定位（参考只读）
+
+完整仓库（用户下载，参考只读，**不同步到 Intel**，太重）：本机 `/home/V01/uid05044/uid05044/code/cvcuda-ops-sycl/CV-CUDA-0.16.0/`
+
+resize 算子相关文件：
+
+| 文件 | 性质 | 移植时怎么用 |
+|---|---|---|
+| `src/cvcuda/priv/OpResize.cu` | **真 CUDA kernel**（4 插值 + host 分发），20803 字节 | **核心翻译对象**，逐字翻译 4 个 kernel |
+| `src/cvcuda/include/cvcuda/OpResize.h` | 公开 C API + **limitations 表**（支持 dtype/通道/布局） | 当**规格说明书**，照着支持范围 |
+| `src/cvcuda/include/cvcuda/OpResize.hpp` | 公开 C++ 类 | 框架胶水，不移植 |
+| `src/cvcuda/OpResize.cpp` | C API 导出（cvcudaResizeCreate/Submit） | 框架胶水，不移植 |
+| `src/cvcuda/priv/OpResize.cpp` + `.hpp` | priv 类，取 TensorDataStridedCuda + var-shape 分发 | 框架胶水，不移植（var-shape 走 legacy） |
+| `src/cvcuda/priv/legacy/resize_var_shape.cu` | **var-shape 真 kernel**（NN/bilinear/bicubic/area_ocv），21344 字节 | phase6 翻译对象（NN/LIN/CUB，area 跳过） |
+| `src/cvcuda/include/cvcuda/cuda_tools/SaturateCast.hpp` | 饱和类型转换 | 参考重写 |
+| `src/cvcuda/include/cvcuda/cuda_tools/TensorWrap.hpp` | NHWC tensor wrapper（ptr/operator[]/ValueType） | 参考重写最小版 |
+| `src/cvcuda/include/cvcuda/cuda_tools/InterpolationWrap.hpp` | AREA 插值包装（area 均值逻辑在这） | phase4 参考 |
+| `src/cvcuda/include/cvcuda/cuda_tools/{MathOps,MathWrappers,DropCast,StaticCast,TypeTraits}.hpp` | min/max/abs/cast 小工具 | 参考重写 |
+| `tests/cvcuda/system/TestOpResize.cpp` + `ResizeUtils.cpp` | NVIDIA 官方 C++ 测试 | 可作正确性参照（未直接用） |
+
+**移植思路（同体素化）**：剥掉 nvcv/cvcuda 框架（IOperator/TensorDataStridedCuda/ImageBatchVarShape/cvcudaResizeSubmit 全不要），只留 kernel 算法 + 最小自研 tensor wrapper。接口自设计 `run_resize<T,C>` / `run_resize_varshape<T,C>`，非 drop-in 替换。
+
+---
+
+## 2. 四种插值算法（已读完 OpResize.cu 源码）
+
+| 插值 | 采样 | 坐标映射 | 边缘处理 | kernel |
+|---|---|---|---|---|
+| NEAREST | 1 像素 | `srcCoord = (dst+0.5)*scale` | floor + clamp [0,size-1] | NearestResize |
+| LINEAR | 2×2 | `srcCoord = (dst+0.5)*scale - 0.5` | floor + 边缘 wx=0/1 + clamp [0,size-2] | LinearResize |
+| CUBIC | 4×4 | `srcCoord = (dst+0.5)*scale - 0.5` | fx 在 x 边缘置零(非对称), isx/isy clamp [1,size-3], abs+ SaturateCast | CubicResize |
+| AREA | 盒均值 | 足迹 `[x·sx,(x+1)·sx)×[y·sy,(y+1)·sy)`（**无 +0.5**） | xmin=ceil(fsx1)/xmax=floor(fsx2), 整数 scale 简单均值, 非整数 9 项分数边缘 | AreaResize + InterpolationWrap |
+
+- `scaleRatio = srcSize / dstSize`（per-axis）。
+- CUBIC 用 Keys 核 A=-0.75（`get_cubic_coeffs`）。
+- AREA 的 scale 全在 **host 算好传入** kernel，kernel 内无除法 → 不受 Intel GPU FP 除法问题影响（maxerr 极小）。
+- 支持规格（来自 OpResize.h）：布局 NHWC/HWC，通道 1/3/4，dtype U8/U16/S16/F32。**本次移植实现 F32/U8 × C1/C3/C4**（U16/S16 未做，加 SaturateCast 特化即可）。
+
+---
+
+## 3. CUDA → SYCL 映射表（移植依据）
+
+| CUDA (CV-CUDA) | SYCL (本移植) |
+|---|---|
+| `__global__ kernel<<<grid,block,0,stream>>>(...)` | `q.parallel_for(range<3>{N,H,W}, [=](item<3> it){...})` |
+| `SrcWrapper/DstWrapper`（TensorWrapNHW） | `TensorView<T,C>`（自研最小 NHWC wrapper，USM 指针 + 形状） |
+| `src[int3{x,y,z}]` / `dst.ptr(z,y)` | `s.read(x,y,z,pix[C])` / `d.write(x,y,z,pix[C])` |
+| `cuda::SaturateCast<T>(v)` | `cvsycl::SaturateCast<T>(v)`（float 恒等，uint8_t 半偶舍入+clamp） |
+| `cuda::min/max/floor/abs` | `sycl::min/max/floor/fabs` + `cvsycl::min/max/clamp` 别名 |
+| `cuda::DropCast<2>` / `StaticCast<float>` | 直接 float 运算（C=1 简化） |
+| `cudaMalloc/Free` + `cudaMemcpyAsync` | `sycl::malloc_device<T>(n,q)` / `sycl::free` + `q.copy<T>` |
+| `cudaStream_t` / sync | `sycl::queue{gpu_selector_v, in_order}` / `q.wait()` |
+| `NIX<T>` pack write（WritePack） | phase5b：NIX dst 像素/线程 + INTERSECT 读复用（U8 才开） |
+| `ImageBatchVarShapeWrap`（var-shape） | `VarShapeBatch<T,C>`（自研 pitched：rowPitch=maxW·C，imageStride=maxH·maxW·C） |
+
+### 关键设计点
+1. **像素按 `T[C]` 数组读写**（不用 sycl::vec，避免 vec<.,1> 的别扭）；kernel 按通道在 float 里插值，末尾 `SaturateCast<T>` 回写。
+2. **wrapper 模板化 `<T,C>`**，C 编译期常量（1/3/4），`#pragma unroll` 展开通道循环。
+3. **header-only kernel**（resize.hpp / resize_varshape.hpp 全模板 inline），test 直接 include，build.sh 只编 test。
+4. **USM device 内存 + 显式 H2D/D2H copy**（同体素化，in-order queue）。
+5. **SaturateCast host/device 同一份代码**（用 sycl::round，host 也能调），保证 CPU 参照与 GPU kernel 用完全相同的舍入。
+
+### 关键坑（移植中踩到/避开的）
+1. **C++ 模板特化顺序**：`SaturateCast` 的 `<float>`/`<uint8_t>` 全特化**必须写在主模板声明之后**，否则报 "no matching function"（phase2 编译错一次，调换顺序修复）。
+2. **CUBIC 非对称边缘**：原版只对 `fx`（x 轴）在边缘置零，`fy`（y 轴）不置零只 clamp。**必须照抄**否则输出不一致（CPU 参照也会照抄，但仍要忠实）。
+3. **AREA 的 ceil/floor**：`xmin=ceil(fsx1)`（round UP）、`xmax=floor(fsx2)`（round DOWN），来自 `GetIndexForInterpolation` AREA 的 position 1/2。**不是** +0.5 偏移。
+4. **负数左移 UB**：`-1 << 30` 是未定义行为（phase5b 初版写过），改 `int iPrevX=0` + `bool have` 守卫。
+5. **NIX 门控**：F32 对齐 4 字节读本就便宜，NIX 减线程数反损并行度（实测 F32 C1 回退 8%）。故 `kNIX = (sizeof(T)==1) ? 公式 : 1`，只对 U8 开 NIX+INTERSECT，F32 走 NIX=1 简单路径。
+6. **U8 LINEAR 容差 ±1**：Intel GPU 浮点边界舍入可致 U8 在 x.5 处差 1（同体素化 ±1 邻居分析），测试用 ±1 容差。实测这批用例 maxerr=0，容差作安全网。
+
+---
+
+## 4. 已完成的移植代码（本机 `cvcuda-ops-sycl/OpResize/` = source of truth）
+
+```
+common/tensorwrap.hpp      TensorView<T,C> 最小 NHWC wrapper (模板, read/write 像素 T[C])
+common/varshape.hpp        VarShapeBatch<T,C> pitched 变尺寸 batch (per-image imgW/imgH 设备数组)
+common/saturate_cast.hpp   SaturateCast<float>(恒等) + <uint8_t>(sycl::round 半偶 + clamp [0,255])
+common/math_ops.hpp        min/max/clamp 小工具
+resize.hpp                 header-only 模板 kernel: nearest/linear/cubic/area + run_resize<T,C> 分发
+                           (LINEAR 含 NIX+INTERSECT 读复用, kNIX 门控)
+resize_varshape.hpp        header-only 模板 kernel: varshape NN/linear/cubic + run_resize_varshape<T,C>
+OpResize.cpp               原始 NVIDIA op 包装源(参考, 不参与编译)
+build.sh                   icpx -fsycl 编 3 个二进制
+test/test_resize.cpp       固定尺寸正确性 25 用例 (F32/U8 x C1/C3/C4, 4 插值, 上/下/非整数/batch)
+test/test_resize_profile.cpp  性能 profiling (SYCL event, best-of-20, 大图 1920x1080)
+test/test_resize_varshape.cpp  var-shape 正确性 11 用例 (N=2~3 不同尺寸图)
+```
+
+Intel 机镜像：`/work/bevfusion_migration/cvcuda_ops/OpResize/`（内容与本机一致，base64 分块传输，md5 校验）。
+
+### 编译+运行（已验证）
+```bash
+ssh ***  # 密码 ***REDACTED***
+./***REDACTED***          # → ***REDACTED*** (***REDACTED***)
+cd /work/bevfusion_migration/cvcuda_ops/OpResize
+bash build.sh               # 宿主机 icpx, 编 3 个二进制到 test/
+export ONEAPI_DEVICE_SELECTOR=opencl:gpu   # 必须! Level Zero 后端有 bug
+./test/test_resize            # 固定尺寸正确性 (25 用例)
+./test/test_resize_varshape   # var-shape 正确性 (11 用例)
+./test/test_resize_profile    # 性能 profiling
+```
+
+---
+
+## 5. 移植各 phase 完成情况
+
+### phase1 ✅ F32/C1 NEAREST+LINEAR
+- 最小 NHWC wrapper + SaturateCast 空壳(F32) + 合成小图测试(2×2→4×4 等 6 用例)。
+- 一次通过：ALL TESTS PASSED，maxerr≈0。
+- 快照：`snapshots/resize_phase1_2026-06-29/`。
+
+### phase2 ✅ U8 + 多通道 + SaturateCast 做实
+- `TensorView<T,C>` 模板化；`SaturateCast` 加 uint8_t 特化（sycl::round 半偶舍入对齐 CUDA `__float2int_rn` + clamp [0,255]）；kernel header-only（删 resize.cpp）。
+- 测试扩到 13 用例（F32/U8 × C1/C3/C4）。
+- 坑：模板特化顺序（见 §3 坑1），修后通过。
+- 快照：`snapshots/resize_phase2_2026-06-29/`。
+
+### phase3 ✅ Cubic
+- `get_cubic_coeffs`（Keys A=-0.75）+ `cubic_resize`（4×4 采样，abs + SaturateCast），忠实保留原版非对称边缘（fx 在 x 边缘置零、fy 不置零、clamp [1,size-3]，需 src≥4）。
+- 测试 19 用例（+6 cubic：F32/U8 × C1/C3）。
+- 快照：`snapshots/resize_phase3_2026-06-29/`。
+
+### phase4 ✅ Area
+- 移植 `OpResize.cu::AreaResize` + `InterpolationWrap` AREA 特化。dst 像素源足迹 `[x·sx,(x+1)·sx)×[y·sy,(y+1)·sy)`（无 +0.5），xmin=ceil/xmax=floor，整数 scale 简单均值，非整数 9 项分数边缘。**所有 scale host 算好传入，kernel 无除法** → 不受 Intel GPU FP 除法影响（maxerr F32~1e-6、U8=0）。border 常量 0。
+- 测试 25 用例（+6 area：整数/非整数下采样、上采样、U8 C3、batch）。
+- 快照：`snapshots/resize_phase4_2026-06-29/`。
+
+### phase5 ✅ 性能 profiling
+- `test_resize_profile.cpp`：SYCL queue `enable_profiling`，大图(1920×1080 F32 C1 + U8 C3 + U8 C1)，上/下采样，warmup + best-of-20 device ms + dst Gpix/s + GB/s。
+- 基线数据存 `snapshots/resize_phase5_profile_2026-06-29/profile_results.txt`。
+- 快照：`snapshots/resize_phase5_profile_2026-06-29/`。
+
+### phase5b ✅ LINEAR NIX+INTERSECT 读复用优化
+- 移植 CUDA `LinearInterpolatePack<INTERSECT=true>`：每线程处理 NIX 个连续 dst 像素，相邻 dst 映射同 src 时复用 2×2 邻域，src x+1 时增量读 2 个。
+- `kNIX` 门控：`sizeof(T)==1`(U8) 才开 NIX(C=1→16,C=3→4,C=4→4)，F32 走 NIX=1（避免并行度损失）。
+- 结果：**U8 C3 上采样 4K LINEAR 3.27→1.79ms (1.83×)**，U8 C3 下采样 0.151→0.103ms(1.47×，反超 NEAREST)，F32 持平。正确性 25 用例 bit-一致。
+- 快照：`snapshots/resize_phase5b_linear_opt_2026-06-29/`（含 profile_results.txt）。
+
+### phase6 ✅ var-shape 变尺寸
+- `VarShapeBatch<T,C>`（pitched：rowPitch=maxW·C，imageStride=maxH·maxW·C，per-image imgW/imgH 设备数组）+ NN/LINEAR/CUBIC kernel（在 max dst 维度 launch，每线程按本图尺寸 bounds-check，per-image scale，插值数学同固定尺寸版）。
+- **AREA var-shape 未移植**（原版用另一套 OpenCV-aligned 实现 `resize_area_ocv_align` + BorderVarShapeWrap，复杂少用，标注为限制）。
+- 测试 11 用例（F32/U8 × C1/C3，NN/LIN/CUB，N=2~3 不同尺寸图）。固定尺寸 25 仍全过。
+- 快照：`snapshots/resize_phase6_varshape_2026-06-29/`。
+
+---
+
+## 6. 性能基线与优化结果（Intel Arc [0xb080], opencl:gpu, best-of-20）
+
+### 基线 + 优化后对比（LINEAR 是优化目标）
+
+| 场景 | phase5 基线 | phase5b 优化后 | 变化 |
+|---|---|---|---|
+| F32 C1 上采样 4K LINEAR | 0.350ms / 23.7 Gpix/s | 0.358ms / 23.2 | 持平（门控保护）|
+| **U8 C3 上采样 4K LINEAR** | 3.267ms / 2.5 Gpix/s | **1.790ms / 4.6** | **1.83×** ⬆️ |
+| U8 C3 下采样 LINEAR | 0.151ms | 0.103ms | 1.47× ⬆️（反超 NEAREST）|
+| U8 C1 上采样 4K LINEAR | — | 0.346ms / 24.0 Gpix/s | NIX=16 表现好 |
+
+### 完整基线表（phase5b 后）
+
+```
+[F32 C1 downscale 1920x1080->960x540]   NEAR 0.114 / LIN 0.125 / CUB 0.122 / AREA 0.123 ms
+[F32 C1 upscale  ->3840x2160]           NEAR 0.323 / LIN 0.358 / CUB 0.502 ms
+[U8 C3 downscale ->960x540]             NEAR 0.115 / LIN 0.103 / AREA 0.143 ms
+[U8 C3 upscale   ->3840x2160]           NEAR 1.279 / LIN 1.790 ms
+[U8 C1 upscale   ->3840x2160]           NEAR 0.293 / LIN 0.346 ms
+```
+
+### 瓶颈分析
+1. **小图 launch-bound**：960×540 输出 ~0.1ms，4 种插值差异极小，固定 launch 开销主导。要更快需 batch 融合/算子链。
+2. **U8 C3 多字节像素访存未对齐**是主要可优化点（phase5b 已对 LINEAR 处理，U8 C3 1.83×）。
+3. **F32 C1 大图已较快**（25 Gpix/s），优化空间小。
+4. NEAREST/CUBIC/AREA 未做 NIX 优化（非瓶颈；CUBIC 用得少，NEAREST 已快，AREA host 算 scale 已无除法）。
+
+---
+
+## 7. 已验证事实
+
+- **移植已跑通**：宿主机 icpx 2025.3.3 编译 3 个二进制，宿主机 opencl 后端运行，36 用例全 PASS，无段错误。
+- **固定尺寸正确性**：25 用例（F32/U8 × C1/C3/C4 × NEAREST/LINEAR/CUBIC/AREA，上/下采样、非整数比例、batch N=2）全 PASS。maxerr：NEAREST=0，LINEAR/CUBIC F32~1e-5、U8=0，AREA F32~1e-6、U8=0。
+- **var-shape 正确性**：11 用例（F32/U8 × C1/C3 × NN/LIN/CUB，N=2~3 不同尺寸图，上/下/非整数）全 PASS。
+- **LINEAR 优化保持正确性**：phase5b NIX+INTERSECT 后 25 用例 bit-一致（U8 LINEAR 在 ±1 容差内）。
+- **性能**：U8 C3 上采样 4K LINEAR 3.27→1.79ms（1.83×），其余持平或优化。
+- **AREA 不受 Intel GPU FP 除法问题影响**：所有 scale 在 host 算好传入，kernel 无除法（maxerr 极小）。
+- **kNIX 门控正确**：F32 NIX=1 简单路径避免 8% 回退，U8 NIX 公式获加速。
+- **环境复用体素化任务**：icpx / opencl 后端 / in-order queue / USM device 内存模式全一致（见 `claude_task_vaxelizer` §1）。
+- **7 个 phase 快照已存**：`cvcuda-ops-sycl/snapshots/resize_phase{1,2,3,4,5_profile,5b_linear_opt,6_varshape}_2026-06-29/`，各含 md5 清单，可回退复现。
+- **build.sh 编 3 个二进制**：test_resize（固定正确性）+ test_resize_profile（性能）+ test_resize_varshape（var-shape 正确性）。
+
+### ⚠️ 验证局限（诚实声明，重要）
+1. **自洽验证，非对齐验证**：正确性测试用的是**我自己写的 CPU 同算法参照**，证明"SYCL kernel == 我的 CPU 实现"，**不直接证明 == NVIDIA CV-CUDA 实际输出**。若我对原算法某处理解错，CPU 和 GPU 会一起错，测试仍 PASS。
+   - 缓解：关键逻辑（坐标公式、`get_cubic_coeffs` A=-0.75、AREA 的 ceil/floor 边缘、CUBIC 非对称 fx 置零、SaturateCast 半偶舍入）**逐字照抄原版**，非重写，理解错风险集中在边缘细节。
+2. **未与 NVIDIA CV-CUDA 二进制做 bit 级 diff**：真正的金标准是同图同参数喂 NVIDIA `cvcudaResize` 和本 SYCL kernel 比输出。**这一步没做**（需 NVIDIA GPU + 编译 CV-CUDA，Intel Arc 跑不了 CUDA 版；P2200 跳板机/thor/orin 等 NVIDIA 机器理论可行但未做）。
+3. **合成数据 ≠ 真实图像极端情况**：没用真实图片做端到端测试，可能存在未测到的边界（极大图整数溢出、特殊宽高比等）。
+4. **性能数字有 ±10%+ 噪声**（Arc GPU 跨进程时钟/热漂移），best-of-20 取最优，非精确值。
+
+---
+
+## 8. 文件清单与位置
+
+| 位置 | 内容 |
+|---|---|
+| 本机 `/home/V01/uid05044/uid05044/code/cvcuda-ops-sycl/OpResize/` | **本算子 source of truth**：本文档 + resize.hpp + resize_varshape.hpp + build.sh + common/{tensorwrap,varshape,saturate_cast,math_ops}.hpp + test/{test_resize,test_resize_profile,test_resize_varshape}.cpp + OpResize.cpp(原始 NVIDIA 参考) |
+| 本机 `cvcuda-ops-sycl/CV-CUDA-0.16.0/` | 完整 NVIDIA 仓库（参考只读，不同步 Intel） |
+| 本机 `cvcuda-ops-sycl/snapshots/resize_phase*_2026-06-29/` | 7 个 phase 快照（各含 md5 + profile_results.txt，可回退） |
+| 本机 `cvcuda-ops-sycl/{OpCvtColor,OpNonMaximumSuppression,OpNormalize,OpRemap,OpRotate}/` | 其余 5 个算子文件夹（各含原始 Op*.cpp，待移植） |
+| **Intel 机 `/work/bevfusion_migration/cvcuda_ops/OpResize/`** | **Intel 侧镜像**（与本机一致，base64 传输 md5 校验）|
+| Intel 机 `/work/bevfusion_migration/cvcuda_ops/{OpCvtColor,...,OpRotate}/` | 其余 5 个算子空文件夹（已建，待移植）|
+| 本机 `~/.claude/projects/-home-V01-uid05044/memory/bevfusion-voxelization-port-project.md` | 项目记忆（含 cvcuda resize 进度块）|
+| 本机 `lidar-voxelization/claude_task_vaxelizer` | 体素化任务上下文文档（通用环境信息见其 §1）|
+
+### 传输方式
+- 本机编辑 → tar+base64 分块（≤800 字符/块，远低于 PTY ~4096 限制）→ pexpect SSH 会话（本机→跳板→***REDACTED***→intel）`printf %s <块> >> /tmp/opresize.b64` 逐块追加 → `base64 -d | tar xz -C /work/bevfusion_migration/cvcuda_ops/`。
+- 脚本：`/tmp/ssh_opresize_build.py` / `/tmp/ssh_opresize_prof.py` / `/tmp/ssh_opresize_vs.py`（易失，重启清；模式同体素化 `ssh_*.py`）。
+
+---
+
+## 9. 下次继续点（压缩后从这里接）
+
+**当前状态**：resize 算子移植**主体全部完成** ✅ — 固定尺寸 4 插值(NEAR/LIN/CUB/AREA) + var-shape 3 插值(NEAR/LIN/CUB, AREA 限制) + LINEAR NIX+INTERSECT 优化(U8 C3 1.83×) + 性能 profiling，F32/U8 × C1/C3/C4，**36 用例全 PASS**（25 固定 + 11 var-shape）。7 个 phase 快照齐全。Intel 机 `/work/bevfusion_migration/cvcuda_ops/OpResize/` 同步。
+
+**已知限制 / 未做**：
+1. AREA var-shape 未移植（原版另一套 OCV-aligned 实现）。
+2. U16/S16 dtype 未做（加 SaturateCast 特化即可）。
+3. 未与 NVIDIA CV-CUDA 做 bit 级 diff（验证局限，见 §7）。
+4. 未集成进 nvcv/cvcuda 框架（独立 SYCL 算子，非 drop-in 替换）。
+5. NEAREST/CUBIC/AREA 未做 NIX 优化（非瓶颈）。
+
+**可选后续**：
+- (a) AREA var-shape 移植（复杂，少用）。
+- (b) U16/S16 dtype 支持。
+- (c) **对齐 NVIDIA 验证**：在 P2200/thor/orin 等 NVIDIA 机器跑 CV-CUDA 原版做 bit diff（真正的正确性金标准）。
+- (d) NEAREST/CUBIC 的 NIX 优化（收益小）。
+- (e) **同步 resize 到 GitHub**（并入 wall1688/bevfusion-voxelization-sycl 仓库，或单独建 cvcuda 仓库）。
+- (f) **开始下一个算子**：OpRemap / OpRotate / OpCvtColor / OpNormalize / OpNonMaximumSuppression（5 个待移植，工作目录已建）。
+
+**复用命令**（宿主机）：
+```
+ssh ***  # 密码 ***REDACTED***
+./***REDACTED***          # → ***REDACTED***
+cd /work/bevfusion_migration/cvcuda_ops/OpResize
+bash build.sh
+export ONEAPI_DEVICE_SELECTOR=opencl:gpu
+./test/test_resize            # 固定尺寸 25 用例
+./test/test_resize_varshape   # var-shape 11 用例
+./test/test_resize_profile    # 性能
+```
+
+**代码改动流程**：本机编辑 `cvcuda-ops-sycl/OpResize/` → tar+base64 分块传 Intel（pexpect 模板见 `/tmp/ssh_opresize_vs.py`）→ 编译运行验证 → 每稳定版本存快照到 `cvcuda-ops-sycl/snapshots/`。约束：Intel 侧只改 `/work/bevfusion_migration/cvcuda_ops/` 内。
