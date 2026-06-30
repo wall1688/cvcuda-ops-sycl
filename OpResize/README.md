@@ -3,6 +3,24 @@
 > 本文件说明：做了什么、文件夹里是什么、怎么编译运行、性能如何、以及过程中的一些思考。
 > 更详尽的过程上下文见同目录 `claude_task_resize`（273 行，逐 phase 记录）。
 
+## 0. 最近复现验证记录
+
+> 让未来的我能快速确认「这套东西现在还能跑」。每次重跑后更新本节日期与数字。
+
+- **最近一次验证**：2026-06-30，在 Intel 机 `nodka-ptl`（Intel Arc Graphics [0xb080]，OpenCL 后端）上直接 `./test/test_resize*` 重跑。
+- **正确性**：`test_resize`（25 用例）+ `test_resize_varshape`（11 用例）均 `=== ALL TESTS PASSED ===`，共 36 用例全 PASS。
+- **性能（best-of-20，best ms）**，与首次完成时一致（差异 <0.5%，在 Arc 跨进程 ±10% 噪声内）：
+
+```
+[F32 C1 downscale 1920x1080->960x540]  NEAR 0.0932 / LIN 0.1025 / CUB 0.0703 / AREA 0.0714
+[F32 C1 upscale  ->3840x2160]          NEAR 0.3230 / LIN 0.3571 / CUB 0.5021
+[U8 C3 downscale ->960x540]            NEAR 0.1156 / LIN 0.1033 / AREA 0.1426
+[U8 C3 upscale   ->3840x2160]          NEAR 1.2767 / LIN 1.7907
+[U8 C1 upscale   ->3840x2160]          NEAR 0.2932 / LIN 0.3448
+```
+
+- **结论**：代码、二进制、结果均可复现，处于完整可用状态。若重跑对不上，先看 §8 注意事项（多半是忘了 `export ONEAPI_DEVICE_SELECTOR=opencl:gpu`，或跨进程噪声）。
+
 ## 1. 这是什么
 
 把 NVIDIA CV-CUDA 0.16.0 的 Resize 算子（CUDA）移植到 Intel SYCL，在 Intel Arc Graphics [0xb080] GPU 上跑通、验证、优化。这是 cvcuda 算子移植系列的**第 1 个算子**（前一个 BEVFusion 体素化算子已完成）。
@@ -66,6 +84,41 @@ bash build.sh
 
 下面命令假设在 `.../OpResize` 目录。
 
+### 5.0 从零开始运行（终端新手向）
+
+> 本机是虚拟机，没有真实 GPU。编译/运行都必须在 Intel 物理机上做。路径：本机 → ssh 跳板机 → 进入 Intel 机 → 进 OpResize 目录 → 设 GPU 后端 → 跑测试。
+
+逐行敲（每行回车执行）：
+
+```bash
+# 1) 本机终端连跳板机（密码不回显，盲打回车）
+ssh <跳板机用户>@<跳板机IP>
+#   首次问 yes/no 就敲 yes；password: 输跳板机密码
+
+# 2) 跳板机上进 Intel 机（可能再问一次密码，同样输密码）
+./connect_intel.sh
+#   看到提示符变成 user@nodka-ptl:~$ 就成功了
+
+# 3) 进 OpResize 目录
+cd /work/bevfusion_migration/cvcuda_ops/OpResize
+
+# 4) 设 GPU 后端（每次新登录都要做！否则段错误）
+export ONEAPI_DEVICE_SELECTOR=opencl:gpu
+
+# 5) 跑测试（见 5.1 / 5.2 / 5.3）
+./test/test_resize
+./test/test_resize_varshape
+./test/test_resize_profile
+
+# 6) 看完退出：敲两次 exit（先退回跳板，再退回本机）
+exit
+exit
+```
+
+> 跳板机地址 / 密码 / `connect_intel.sh` 等连接凭据**不放在公开仓库**。本机见 `claude_task_resize`（脱敏版）或本机 Claude 记忆 `bevfusion-intel-env`；含真实凭据的版本只存本机工作副本，不提交。
+
+常见坑：跑测试报 `Segmentation fault` = 99% 是忘了第 4 步；密码怎么敲都没反应是正常的（不回显）。
+
 ### 5.1 固定尺寸正确性（25 用例）
 ```bash
 ./test/test_resize
@@ -83,6 +136,37 @@ bash build.sh
 ./test/test_resize_profile
 ```
 输出大图（1920×1080 F32 C1 + U8 C3 + U8 C1）上/下采样各插值的 best device ms + dst Gpix/s + GB/s。
+
+### 5.4 性能输出各字段含义（怎么看一行结果）
+
+一行典型输出：
+```
+  F32 C1 LINEAR  1920x1080->3840x2160  best=0.3571 avg=0.3584 ms  23.23 Gpix/s  464.6 GB/s
+```
+
+| 字段 | 值 | 含义 |
+|---|---|---|
+| 数据类型 | `F32` / `U8` | 每通道元素类型。F32=32位浮点(4字节)，U8=8位无符号(1字节) |
+| 通道数 | `C1` / `C3` / `C4` | 每像素通道数。C1灰度、C3=RGB、C4=RGBA |
+| 插值 | `NEAREST`/`LINEAR`/`CUBIC`/`AREA` | 缩放采样方式（见 §6） |
+| 尺寸 | `1920x1080->3840x2160` | 输入 宽×高 → 输出 宽×高 |
+| `best` | `0.3571 ms` | 20 次里**最快一次**的 GPU kernel 耗时 |
+| `avg` | `0.3584 ms` | 20 次**平均**耗时 |
+| `Gpix/s` | `23.23` | 吞吐：每秒产出多少**十亿个输出像素** |
+| `GB/s` | `464.6` | 有效内存带宽：每秒读写多少 GB（估算值） |
+
+**怎么测的**：5 次预热 + 20 次正式跑，每次用 SYCL event 记录 GPU 上 kernel 真实起止时间。`best = min(20次)`，`avg = mean(20次)`。取 best 是为了避开 Arc 跨进程 ±10% 的时钟/热噪声，接近"这块卡的能力上限"。
+
+**怎么算的**（见 `test/test_resize_profile.cpp` 的 `bench()`）：
+- `Gpix/s = 输出像素数(dh·dw) ÷ best(秒) ÷ 1e9`。只数输出像素，不含通道数 → 同尺寸跨插值可比，C1/C3 之间不可直接比。
+- `GB/s = (每输出像素读几个源像素 + 1次写) × 输出元素数 × sizeof(T) ÷ best(秒) ÷ 1e9`。读取数：NEAREST=1、LINEAR=4(2×2)、CUBIC=16(4×4)、AREA=4。
+
+**怎么用这些数字判断好坏**：
+1. 比 best ms：同场景谁小谁快（如 U8 C3 下采样 LIN 0.103 < NEAR 0.116 < AREA 0.143）。
+2. best vs avg 差距：接近=稳；差很多=best 是 lucky 值，看 avg（如小图 downscale CUBIC best 0.0703 但 avg 0.1130，应看 avg）。
+3. GB/s 接近 GPU 标称带宽=算子访存受限、已喂饱硬件；远低于=还有优化空间。
+
+> ⚠️ **GB/s 是理论估算，不是实测硬件流量**。它假设每输出像素独立读 N 个源像素，但实际有缓存复用。**CUBIC 的 GB/s 会虚高**（如 1123 GB/s，远超显存带宽），因为 16 次读取大量复用 4×4 邻域。GB/s 适合横向对比同类场景，别当绝对真实流量。
 
 ## 6. 四种插值算法要点（移植依据）
 

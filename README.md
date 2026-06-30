@@ -10,6 +10,8 @@ NVIDIA CV-CUDA 0.16.0 算子从 CUDA 移植到 Intel SYCL，目标平台 Intel A
 |---|---|---|---|---|
 | **OpResize** | ✅ 完成 | NEAREST / LINEAR / CUBIC / AREA + var-shape(NN/LIN/CUB) | F32 / U8 × C1/C3/C4 | 36 用例全 PASS |
 
+> 最近复现验证：2026-06-30 在 Intel Arc [0xb080] (opencl:gpu) 重跑 36 用例全 PASS，性能数据一致（见 `OpResize/README.md` §0）。
+
 ### OpResize 亮点
 - 4 种插值固定尺寸 + var-shape 变尺寸，忠实翻译 `priv/OpResize.cu` + `priv/legacy/resize_var_shape.cu`。
 - LINEAR NIX+INTERSECT 读复用优化：U8 C3 上采样 4K **3.27→1.79ms（1.83×）**，F32 经 kNIX 门控无回退。
