@@ -1,0 +1,19 @@
+# build.sh NMS integration patch (optional)
+#
+# The NMS port ships a self-contained `cvcuda_ops/nms/build_nms.sh` that builds
+# its 3 targets without touching the top-level build.sh — use that by default.
+#
+# If you later want the NMS targets folded into the unified top-level build.sh
+# (so a single `bash build.sh` builds voxelization + NMS), append this block at
+# the end of build.sh, just before its final `echo "[build.sh] all 6 targets
+# built."` line (and update that count to 9):
+
+# ---- NMS (CV-CUDA NonMaximumSuppression) ----
+NMS_SRC=cvcuda_ops/nms/nms.cpp
+NMS_T=cvcuda_ops/nms/test
+"${CXX}" "${COMMON_FLAGS[@]}" "${NMS_SRC}" "${NMS_T}/correctness/test_nms.cpp" -o "${NMS_T}/correctness/test_nms"
+echo "[build.sh] built ${NMS_T}/correctness/test_nms"
+"${CXX}" "${COMMON_FLAGS[@]}" "${NMS_SRC}" "${NMS_T}/real/test_nms_real.cpp" -o "${NMS_T}/real/test_nms_real"
+echo "[build.sh] built ${NMS_T}/real/test_nms_real"
+"${CXX}" "${COMMON_FLAGS[@]}" "${NMS_SRC}" "${NMS_T}/profile/test_nms_profile.cpp" -o "${NMS_T}/profile/test_nms_profile"
+echo "[build.sh] built ${NMS_T}/profile/test_nms_profile"

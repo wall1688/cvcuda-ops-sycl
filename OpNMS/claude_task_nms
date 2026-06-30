@@ -1,0 +1,167 @@
+# CV-CUDA NonMaximumSuppression 算子移植 — 工作上下文记录
+
+> 记录时间:2026-06-29
+> 任务:把 NVIDIA CV-CUDA 0.16.0 的 NonMaximumSuppression 算子(CUDA)移植到 Intel SYCL,在 Intel Arc [0xb080] GPU 上跑通、验证、profiling。
+> cvcuda 算子移植系列之一(Resize 已完成,见 `../OpResize/`)。
+> 严格约束:Intel 侧只在 `/work/bevfusion_migration/cvcuda_ops/` 内工作;本仓在 `OpNMS/` 内工作。不动其它目录。
+> 通用环境信息(本机 VM 无 GPU,编译+运行必须 ssh 到 Intel 机;`ONEAPI_DEVICE_SELECTOR=opencl:gpu` 强制;宿主机 icpx 编译)同体素化/Resize 任务,不赘述。
+
+---
+
+## 0. 移植路线
+
+单 phase:NMS 是单 kernel、无原子、无 hash 表、无中段 host sync → 没有 opt 阶梯,直接 1:1 移植 + 正确性 + profiling。
+**当前状态:移植主体完成,4 用例 correctness PASS + real REAL-DATA TEST PASSED + profiling 完成。**
+
+---
+
+## 1. 环境准备(沿用已打通的 Intel 开发板环境)
+
+环境结论(已在体素化/Resize 阶段验证,不重复踩坑):
+1. 宿主机已安装完整 oneAPI 工具链,icpx 2025.3.3(已加入 PATH)。
+2. `sycl-ls` 识别 GPU:`Intel(R) Graphics [0xb080]`。
+3. **必须强制 OpenCL 后端**:`export ONEAPI_DEVICE_SELECTOR=opencl:gpu`。Level Zero 后端在本机跑任何 SYCL kernel 都会段错误(崩溃在 `libze_intel_gpu.so.1` 的 `zeCommandListAppendLaunchKernel`),硬件/驱动固有问题,`-ffp-model=precise` 等编译标志无法改变。
+4. 编译在宿主机进行(容器内无 icpx)。
+
+远程访问链路(本地开发机无 icpx/GPU,代码须推到板子编译运行):
+- 两段 SSH:本地 → 跳板机 → Intel 板。**凭据不硬编码**:通过环境变量 `JUMP_PW` / `JUMP_HOST` / `CONNECT_SH` / `INTEL_PW` 提供,脚本默认值已脱敏(见 `scripts/ssh_nms_{transfer,buildrun}.py`)。
+- 因 `scp` 跳板→板子失败,采用 pexpect + base64 分块(<1500 字符)通过 PTY 流式传文件 + md5 校验。
+
+---
+
+## 2. CV-CUDA 源码定位(参考只读)
+
+| 文件 | 性质 | 移植时怎么用 |
+|---|---|---|
+| `src/cvcuda/priv/OpNonMaximumSuppression.cu` | **真 CUDA kernel**(单 kernel + host 分发) | **核心翻译对象**,逐行翻译 |
+| `src/cvcuda/include/cvcuda/OpNonMaximumSuppression.h` | 公开 C API + limitations | 规格 |
+| `tests/cvcuda/system/TestOpNonMaximumSuppression.cpp`(GoldNMS) | NVIDIA 官方测试的独立 CPU 参考 | **gold 移植来源**(独立于 .cu kernel) |
+
+**移植思路**(同 Resize):剥掉 nvcv/cvcuda 框架(IOperator/TensorDataStridedCuda/cvcudaNonMaximumSuppressionSubmit 全不要),只留 kernel 算法 + 原生 USM 指针。接口自设计 `NonMaximumSuppression` 类 + `create_nms` 工厂,非 drop-in 替换。
+
+---
+
+## 3. 算法(已读完 OpNonMaximumSuppression.cu)
+
+全对(all-pairs)IoU 的 mask-NMS,单 kernel,embarrassingly parallel(每个 box 一个线程)。遍历同 batch 所有其他 box,若 `IoU(X,Y) > iouThreshold` 且本 box 分数更低(或等分但面积更小)则丢弃。输出 per-box keep-mask(uint8,1=保留/0=丢弃)。**mask 输出,不是 torchvision 排序索引列表**。
+
+- 数据:bboxes `short4`(x,y,w,h)`[S,N,4]`;scores `float [S,N]`;out `uint8 [S,N]`。行主序连续,box (b,j) 在 `b*N + j`。
+- `IoU = interArea/unionArea`,坐标整数运算,仅末尾一次 float 除法。
+- tie-break 严格 `<`(等分等面积互不丢弃),与 GoldNMS 一致;`break` 仅早退,与 Y 顺序无关 → 确定。
+
+---
+
+## 4. CUDA → SYCL 映射(移植依据)
+
+| CUDA (CV-CUDA) | SYCL (本移植) |
+|---|---|
+| `__global__ kernel<<<grid,block,0,stream>>>`,grid.z=batch,threadIdx.x=bbox | `q.parallel_for(range<1>{S*N}, [=](id<1> i){...})`,内部分解 `b=idx/N, j=idx%N` |
+| `cuda::Tensor2DWrap<short4>` `[coordX]` | 原生 USM `short*` + `b*numBBoxes + j` 索引 |
+| `short4`(.x/.y/.z=宽/.w=高) | 本地 POD `struct short4{short x,y,z,w;}` |
+| `cuda::max / cuda::min` | `sycl::max / sycl::min`(显式转 int,OpenCL 后端可移植) |
+| `atomicCAS` 等 | **无** |
+| `cudaStream_t stream` | `sycl::queue*`(nullptr 用内部 queue,in-order + `VOX_PROFILE` 开 `enable_profiling`) |
+| kernel 返回 void | `parallel_for` 返回 `sycl::event`,保存供 `last_profile()` 计时 |
+| `Assertf/Asserts`(项目 common/check.hpp) | `std::invalid_argument` 抛出(本算子自包含,不依赖外部 common) |
+
+### 关键设计点
+1. **header-only kernel**(`nms.hpp` 全 inline),test 直接 include,`build.sh` 只编 3 个 test 二进制(同 OpResize 约定)。
+2. **USM device 内存 + 显式 H2D/D2H copy**(in-order queue)。
+3. **入参校验**用 `std::invalid_argument`,替代原项目 `Assertf/Asserts` 宏,使本算子自包含、不依赖 `common/check.hpp`。
+4. **profiling opt-in**:`VOX_PROFILE` 环境变量开 `enable_profiling`,`last_profile()` 返回单 kernel device 时间。
+
+---
+
+## 5. 已完成的移植代码(`OpNMS/` = source of truth)
+
+```
+README.md            工作说明 + 使用指南
+总结.md              移植总结
+claude_task_nms      本文件(详尽过程上下文)
+build.sh             icpx -fsycl 编 3 个二进制(kernel header-only,无需单独编)
+nms.hpp              header-only kernel:short4/compute_iou/compute_area/nms_kernel
+                     + NonMaximumSuppression 接口 + NMSImplement + create_nms 工厂
+build.sh.nms.patch   (遗留)并入旧顶层 build.sh 的可选 patch,仅作参考
+scripts/ssh_nms_transfer.py     pexpect SSH 传输(凭据走环境变量,默认已脱敏)
+scripts/ssh_nms_buildrun.py     pexpect SSH 板上 build+run
+test/nms_gold.hpp    CPU gold(移植自 CV-CUDA GoldNMS)
+test/test_nms.cpp         固定合成正确性(4 用例)
+test/test_nms_real.cpp    随机大规模正确性 + FP 边界分析 + wall 性能
+test/test_nms_profile.cpp 逐 kernel event profiling(best-of-20)
+```
+
+板上镜像:`/work/bevfusion_migration/cvcuda_ops/OpNMS/`(内容与本仓一致,base64 分块传输 + md5 校验)。
+
+### 编译+运行(已验证)
+```bash
+cd /work/bevfusion_migration/cvcuda_ops/OpNMS
+bash build.sh
+export ONEAPI_DEVICE_SELECTOR=opencl:gpu   # 必须!Level Zero 后端有 bug
+./test/test_nms                         # 4 用例正确性
+./test/test_nms_real 5000 4 10          # 随机大规模 + 边界分析 + wall
+VOX_PROFILE=1 ./test/test_nms_profile 5000 4 20   # 逐 kernel profiling
+```
+
+---
+
+## 6. 正确性验证结果
+
+### 合成正确性(4 用例,逐 bit vs CPU gold)
+```
+Running on: Intel(R) Graphics [0xb080]
+[mixed]     S=1 N=11 kept=3  mismatch=0  PASS
+[batch2]    S=2 N=4  kept=4  mismatch=0  PASS
+[all_below] S=1 N=3 kept=0 mismatch=0  PASS
+[single]    S=3 N=1 kept=3 mismatch=0  PASS
+=== ALL TESTS PASSED ===
+```
+box 两两 IoU 均明显偏离阈值 0.5 → Intel GPU 除法非 IEEE 舍入无法翻转任何比较 → 逐 bit 一致。
+
+### 随机大规模(S=4 N=5000 → 20000 box)
+```
+CPU kept=1904 / 20000
+mismatch=2 match=99.99% of which IoU-boundary(±0.001)=2 (100%)
+[perf] wall best=1.285ms avg=2.734ms throughput=15.56 Mbox/s
+=== REAL-DATA TEST PASSED ===
+```
+2 个不一致 100% 为 IoU 恰在阈值(0.45)的边界 case → 设备 FP 固有特性,非 port bug。
+
+---
+
+## 7. 性能 profiling 结果
+
+`test_nms_profile`(S=4 N=5000,20 runs,GPU warm,best):
+```
+----- NMS per-kernel (best) -----
+nms_kernel   best=1.276ms avg=1.281ms (100%)
+kernel sum   =1.276ms
+wall         best=1.286ms avg=1.293ms
+overhead     =0.0097ms (launch + wait)
+throughput   kernel=15.67 Mbox/s  wall=15.55 Mbox/s
+```
+- overhead 0.0097ms(kernel ≈ wall):单 kernel 无中段 sync。
+- O(N²) 访存延迟受限:每线程遍历同 batch 全部 N 个 box(随机读,cache miss)。
+- 进一步提速需算法级改动(shared-mem tiling / 按 score 排序早退 / 分块),属另一阶段。
+
+---
+
+## 8. 验证局限(诚实声明,重要)
+1. **自洽验证,非对齐验证**:correctness = GPU 输出 == 我自写的 CPU gold(移植自 CV-CUDA GoldNMS,与 .cu kernel 是两份独立实现),**非** vs NVIDIA 原版输出。若 kernel 与 gold 同源理解错,二者一致地错,测试仍 PASS。缓解:kernel ~10 行,与原 `.cu` 逐行对照;gold 取自源仓独立参考。
+2. **未与 NVIDIA CV-CUDA 做 bit 级 diff**:需 NVIDIA GPU + 编译 CV-CUDA,Intel Arc 跑不了 CUDA 版,未做。
+3. **边界分类循环论证风险**:real 测试用自写 `min_iou_dist_to_thresh` 判边界;更严谨做法是 dump 2 个 divergent box 的精确 IoU 确认卡阈值 —— 后续可补。
+4. **FP 归因是推断**:Intel GPU 除法非 IEEE 舍入的归因来自 precedent + 边界距离检查,非单独证明的根因。
+
+---
+
+## 9. PENDING:与同事 voxelization 约定的对齐修复(未应用)
+
+移植时记录的偏差 B1–B7(本次重组为 OpNMS 自包含格式时已部分消解):
+- B1(并入顶层 build.sh):本仓 `cvcuda-ops-sycl` 每个 Op 自带 `build.sh`,无需并入 —— **已消解**。
+- B2(profile test 自包含 `setenv("VOX_PROFILE","1",1)`):未应用(profile 测试仍需外部 `VOX_PROFILE=1`)。
+- B3(test main 包 `try/catch(sycl::exception&)`):未应用。
+- B4(real test 打印 `[XYZ]` tag —— copy-paste 残留,NMS 无坐标顺序):未移除。
+- B5(`queue& q = *static_cast<queue*>(op->internal_stream())` + `using namespace` 风格):部分沿用。
+- B6(profile 输出表格式对齐):部分。
+- B7(README 测量表风格):已按 OpResize 风格补齐。
+
+**下次继续点**:B2–B4 是可选清理;真正有价值的是 §8 的对齐 NVIDIA 验证(在 NVIDIA 机器跑 CV-CUDA 原版做 bit diff)与 §7 的算法级优化(tiling / 排序)。
