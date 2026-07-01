@@ -1,17 +1,5 @@
-// Ported from CV-CUDA 0.16.0 src/cvcuda/priv/legacy/rotate.cu (tensor path).
-// SYCL port of the Rotate operator. Algorithm/semantics unchanged:
-//   Backward (inverse-map) warp. For each output pixel (n,y,x):
-//     dx = dstX - xShift,  dy = dstY - yShift           (double)
-//     srcX = (float)(dx*cos - dy*sin)
-//     srcY = (float)(dx*sin + dy*cos)
-//     if srcX > -0.5 && srcX < W_in && srcY > -0.5 && srcY < H_in:
-//         out = sample_src(n, srcY, srcX) with BORDER_REPLICATE + interp
-//     else:
-//         out = 0   (exposed corners filled black)
-//   cos/sin computed on the HOST in double (CV-CUDA computes them in a 1-thread
-//   device kernel; computing on host lets kernel and gold share identical
-//   coeffs, isolating divergence to per-pixel float math). Interpolation types
-//   NEAREST / LINEAR / CUBIC, matching CV-CUDA's InterpolationWrap.
+// Ported from CV-CUDA 0.16.0 (tensor path). SYCL port of the Rotate operator.
+// Algorithm/semantics unchanged from the NVIDIA original.
 //
 // Self-contained header-only kernel (matches the cvcuda-ops-sycl convention:
 // the test TUs include this header directly; build.sh only compiles the tests).
@@ -21,6 +9,7 @@
 #ifndef CVCUDA_OPS_ROTATE_HPP
 #define CVCUDA_OPS_ROTATE_HPP
 
+#include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -81,10 +70,6 @@ class Rotate {
 
 inline std::shared_ptr<Rotate> create_rotate();
 
-}  // namespace rotate
-}  // namespace cvcuda
-
-#endif  // __CVCUDA_OPS_ROTATE_HPP__
 
 
 

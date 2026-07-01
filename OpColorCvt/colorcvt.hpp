@@ -1,6 +1,5 @@
-// Ported from CV-CUDA 0.16.0 src/cvcuda/priv/legacy/cvt_color.cu (tensor path).
-// SYCL port of the CvtColor operator (6 color families / 71 codes). Algorithm
-// and semantics are unchanged from the NVIDIA original.
+// Ported from CV-CUDA 0.16.0 (tensor path). SYCL port of the CvtColor operator.
+// Algorithm/semantics unchanged from the NVIDIA original.
 //
 // Self-contained header-only kernel (matches the cvcuda-ops-sycl convention:
 // the test TUs include this header directly; build.sh only compiles the tests).
@@ -11,13 +10,14 @@
 #define CVCUDA_OPS_CVTCOLOR_HPP
 
 #include <cfloat>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
 #include <sycl/sycl.hpp>
 #include <type_traits>
 
-#include "cvt_helpers.hpp"
+#include "colorcvt_helpers.hpp"
 
 namespace cvcuda {
 namespace cvt {
@@ -69,12 +69,8 @@ class CvtColor {
   virtual void* internal_stream() = 0;
 };
 
-inline std::shared_ptr<CvtColor> create_cvt();
+std::shared_ptr<CvtColor> create_cvt();
 
-}  // namespace cvt
-}  // namespace cvcuda
-
-#endif  // __CVCUDA_OPS_CVTCOLOR_HPP__
 
 
 
@@ -966,7 +962,7 @@ class CvtColorImplement : public CvtColor {
   sycl::event ev_;
 };
 
-inline std::shared_ptr<CvtColor> create_cvt() { return std::make_shared<CvtColorImplement>(); }
+std::shared_ptr<CvtColor> create_cvt() { return std::make_shared<CvtColorImplement>(); }
 
 }  // namespace cvt
 }  // namespace cvcuda

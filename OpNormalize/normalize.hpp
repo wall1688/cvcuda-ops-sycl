@@ -1,9 +1,5 @@
-// Ported from CV-CUDA 0.16.0 src/cvcuda/priv/legacy/normalize.cu (tensor path).
-// SYCL port of the Normalize operator. Algorithm/semantics unchanged:
-//   out = SaturateCast<outT>((src - base) * mul * global_scale + shift)
-//   mul = scale                          (plain mode)
-//   mul = 1 / sqrt(scale^2 + epsilon)    (SCALE_IS_STDDEV mode)
-// base/scale broadcast per-axis (each of N/H/W/C independently 1 or matching).
+// Ported from CV-CUDA 0.16.0 (tensor path). SYCL port of the Normalize operator.
+// Algorithm/semantics unchanged from the NVIDIA original.
 //
 // Self-contained header-only kernel (matches the cvcuda-ops-sycl convention:
 // the test TUs include this header directly; build.sh only compiles the tests).
@@ -13,6 +9,7 @@
 #ifndef CVCUDA_OPS_NORMALIZE_HPP
 #define CVCUDA_OPS_NORMALIZE_HPP
 
+#include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -76,10 +73,6 @@ class Normalize {
 
 inline std::shared_ptr<Normalize> create_normalize();
 
-}  // namespace normalize
-}  // namespace cvcuda
-
-#endif  // __CVCUDA_OPS_NORMALIZE_HPP__
 
 
 
