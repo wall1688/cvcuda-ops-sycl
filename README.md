@@ -9,8 +9,9 @@ NVIDIA CV-CUDA 0.16.0 算子从 CUDA 移植到 Intel SYCL，目标平台 Intel A
 | 算子 | 状态 | 插值/功能 | 数据类型 | 测试 |
 |---|---|---|---|---|
 | **OpResize** | ✅ 完成 | NEAREST / LINEAR / CUBIC / AREA + var-shape(NN/LIN/CUB) | F32 / U8 × C1/C3/C4 | 36 用例全 PASS |
+| **OpRemap** | ✅ 完成 | src/map 各 NEAREST/LINEAR/CUBIC + 5 border + 3 mapValueType×alignCorners + var-shape | F32 / U8 × C1/C3/C4 | 45 用例全 PASS |
 
-> 最近复现验证：2026-06-30 在 Intel Arc [0xb080] (opencl:gpu) 重跑 36 用例全 PASS，性能数据一致（见 `OpResize/README.md` §0）。
+> 最近复现验证：2026-06-30 在 Intel Arc [0xb080] (opencl:gpu) 重跑 36 用例全 PASS，性能数据一致（见 `OpResize/README.md` §0）。OpRemap 45 用例于 2026-07-01 全 PASS（见 `OpRemap/README.md` §0）。
 
 ### OpResize 亮点
 - 4 种插值固定尺寸 + var-shape 变尺寸，忠实翻译 `priv/OpResize.cu` + `priv/legacy/resize_var_shape.cu`。
@@ -18,9 +19,16 @@ NVIDIA CV-CUDA 0.16.0 算子从 CUDA 移植到 Intel SYCL，目标平台 Intel A
 - 7 个 phase 快照（`snapshots/`），每步可回退复现。
 - 详见 `OpResize/README.md`（工作说明 + 性能报告）与 `OpResize/总结.md`（移植总结）。
 
+### OpRemap 亮点
+- 2 次采样（map + src 各自独立插值）、5 种 border、3 种 mapValueType×alignCorners，忠实翻译 `priv/OpRemap.cu` + `priv/legacy/remap_var_shape.cu`。
+- shape-agnostic sampler（`sample_impl<View>`）：TensorView 与 VarShapeBatch 共用同一份插值 + border 代码。
+- 内部邻域快速路径优化：CUBIC REFLECT **4.87×** 加速（5.30→1.09ms），bit-identical 38 用例无回归。
+- 7 个 phase 快照（`snapshots/`），每步可回退复现。
+- 详见 `OpRemap/README.md` 与 `OpRemap/总结.md`。
+
 ## 计划移植
 
-OpRemap / OpRotate / OpCvtColor / OpNormalize / OpNonMaximumSuppression（待启动）。
+OpRotate / OpCvtColor / OpNormalize / OpNonMaximumSuppression（待启动）。
 
 ## 环境
 
@@ -38,7 +46,13 @@ OpRemap / OpRotate / OpCvtColor / OpNormalize / OpNonMaximumSuppression（待启
 │   ├── test/                              # 正确性 + profiling 测试
 │   ├── README.md / 总结.md / claude_task_resize
 │   └── build.sh
-└── snapshots/        # OpResize 7 个 phase 源码快照（可回退复现）
+├── OpRemap/          # Remap 算子（已完成）
+│   ├── remap.hpp / remap_varshape.hpp     # header-only 模板 kernel
+│   ├── common/                            # tensorwrap / varshape / saturate_cast / math_ops / border / sampler
+│   ├── test/                              # 正确性（固定 + var-shape）+ profiling 测试
+│   ├── README.md / 总结.md
+│   └── build.sh
+└── snapshots/        # 各算子 phase 源码快照（OpResize / OpRemap，可回退复现）
 ```
 
 ## 验证说明
@@ -48,4 +62,4 @@ OpRemap / OpRotate / OpCvtColor / OpNormalize / OpNonMaximumSuppression（待启
 ## 许可
 
 - 本仓库的移植代码（SYCL kernel、wrapper、测试）采用 MIT 许可（见 `LICENSE`）。
-- 原始算法来自 NVIDIA CV-CUDA 0.16.0（Apache-2.0）。`OpResize/OpResize.cpp` 为原始 NVIDIA 框架源，保留作参考，不参与编译。
+- 原始算法来自 NVIDIA CV-CUDA 0.16.0（Apache-2.0）。`OpResize/OpResize.cpp` 与 `OpRemap/OpRemap.cpp` 为原始 NVIDIA 框架源，保留作参考，不参与编译。

@@ -1,0 +1,16 @@
+Phase 6 perf A/B  (1920x1080 x4 batch, best-of-20, Intel Arc [0xb080])
+config                  base(ms)  opt(ms)  speedup
+f32c1 NEAR REPL          0.570     0.526    1.08x
+f32c1 LIN  REPL          1.026     0.607    1.69x
+f32c1 CUB  REPL          2.829     1.000    2.83x
+f32c1 LIN  REFL          1.647     0.612    2.69x
+f32c1 CUB  REFL          5.299     1.087    4.87x
+u8c4  NEAR REPL          0.646     0.584    1.11x
+u8c4  LIN  REPL          1.324     0.786    1.68x
+u8c4  CUB  REPL          3.197     1.787    1.79x
+Optimization: interior-neighborhood fast-path in sample() (sampler.hpp).
+For in-range neighborhoods, read directly via v.read() skipping getIndexWithBorder
+(integer-modulo for REFLECT/WRAP/REFLECT101 was the hotspot, esp. CUBIC 16 fetches).
+Bit-identical (getIndexWithBorder is identity for in-range idx under all borders).
+Correctness: 38 cases still PASS, maxerr unchanged.
+Stability: optimized re-run within 0.3%.

@@ -2,6 +2,9 @@
 test/test_resize
 test/test_resize_profile
 test/test_resize_varshape
+test/test_remap
+test/perf_remap
+test/test_remap_varshape
 *.o
 *.so
 *.a
