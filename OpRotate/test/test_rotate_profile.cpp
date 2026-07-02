@@ -31,11 +31,16 @@ int main(int argc, char** argv) {
   int S = argc > 2 ? atoi(argv[2]) : 128;
   int C = argc > 3 ? atoi(argv[3]) : 3;
   int runs = argc > 4 ? atoi(argv[4]) : 20;
+  int interp_i = argc > 5 ? atoi(argv[5]) : 1;  // 0=NEAREST,1=LINEAR,2=CUBIC
+  Interp interp = interp_i == 0 ? Interp::NEAREST
+                  : interp_i == 2 ? Interp::CUBIC : Interp::LINEAR;
+  const char* iname = interp_i == 0 ? "NEAREST" : interp_i == 2 ? "CUBIC" : "LINEAR";
 
   auto op = cvcuda::rotate::create_rotate();
   queue& q = *static_cast<queue*>(op->internal_stream());
   std::cout << "Running on: " << q.get_device().get_info<info::device::name>() << "\n";
-  std::cout << "N=" << N << " S=" << S << " C=" << C << " runs=" << runs << "\n";
+  std::cout << "N=" << N << " S=" << S << " C=" << C << " interp=" << iname
+            << " runs=" << runs << "\n";
 
   uint64_t probe = 0;
   if (!op->last_profile(probe)) {
@@ -56,7 +61,7 @@ int main(int argc, char** argv) {
 
   auto run = [&](double& wall_ms, uint64_t& kernel_ns) {
     auto t0 = std::chrono::steady_clock::now();
-    op->forward(d_in, d_out, N, S, S, S, S, C, angle, sx, sy, Interp::LINEAR, DType::F32, &q);
+    op->forward(d_in, d_out, N, S, S, S, S, C, angle, sx, sy, interp, DType::F32, &q);
     q.wait();
     auto t1 = std::chrono::steady_clock::now();
     wall_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -101,7 +106,7 @@ int main(int argc, char** argv) {
     std::vector<float> cpu(nin);
     auto cpu_run = [&]() {
       rotate_gold::gold_rotate<float>(cpu.data(), src.data(), N, S, S, S, S, C, angle, sx, sy,
-                                      Interp::LINEAR);
+                                      interp);
     };
     cpu_run();  // warmup
     int cruns = 3;

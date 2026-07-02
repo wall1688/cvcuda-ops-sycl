@@ -15,17 +15,23 @@ NMS/Normalize/Rotate 各自, ColorCvt 71 codes)。Resize/Remap gold 抽头重构
 后 bit-一致回归通过。
 
 ## Normalize (N=64 H=128 W=128 C=4, F32, plain)
-gpu best_kernel=0.614 ms
-[CPU ref time: 4.381 ms, best-of-3]  speedup = 7.13x
+gpu best_kernel=0.5714 ms
+[CPU ref time: 4.2927 ms, best-of-3]  speedup = 7.51x
+(stddev 模式 CPU gold 多 1/sqrt 会更慢, speedup 更高; 本轮 profile 测 plain)
 
-## Rotate (N=4 S=128 C=3, F32, LINEAR)
-gpu best_kernel=0.0495 ms
-[CPU ref time: 0.470 ms, best-of-3]  speedup = 9.50x
+## Rotate (F32 C3, 23.5°, best-of-3 CPU / best-of-20 GPU)
+  profile 现支持可选第 5 参数 interp(0=NEAREST/1=LINEAR/2=CUBIC, 默认 LINEAR)
+S=128 N=4 C=3 LINEAR  gpu=0.0455ms cpu=0.4867ms  speedup=10.69x
+S=720 N=1 C=3 LINEAR  gpu=0.2413ms cpu=4.9858ms  speedup=20.67x
+S=720 N=1 C=3 CUBIC   gpu=0.2847ms cpu=6.5659ms  speedup=23.06x
+(小图 S=128 launch-bound 故 speedup 低; CUBIC 的 CPU gold 16-tap 慢更多而
+ GPU 被 cache 掩盖, 故 CUBIC speedup 略高于 LINEAR)
 
-## NMS (S=4 N=1000, SC=0.3 IOU=0.45) — gold O(S*N^2), 1 run
-gpu best_kernel=0.282 ms
-[CPU ref time: 10.638 ms, 1 run]  speedup = 37.73x
-(默认 N=5000 时 gold 单次约数十秒, 故用 N=1000 计时; A/B 比值同量级)
+## NMS (SC=0.3 IOU=0.45) — gold O(S*N^2), 1 run — 2026-07-02 复跑
+S=4 N=5000 (20000 box)  gpu=1.1978ms cpu=126.39ms  speedup=105.52x   <- 报告规模
+S=4 N=1000 (4000 box)   gpu=0.282ms  cpu=10.638ms  speedup=37.73x    <- 小规模参考
+(speedup 随 N 升高: gold O(S*N^2) 单线程, N 1000->5000 gold 慢 25x 而 GPU 只慢 ~4x;
+ N=5000 gold 单次 ~126s 故 CPU 只跑 1 次; N 可经 CLI 调小快速复现)
 
 ## Remap (1920x1080 x4 batch, ABSOLUTE identity map, mapN=1, 1 run)
 f32c1 NEAR REPL  gpu=0.535ms  cpu= 63.37ms  speedup=118.50x
@@ -53,21 +59,21 @@ U8 C3 up 3840x2160   LIN  gpu=1.792ms cpu=132.00ms 73.66x
 U8 C1 up 3840x2160   NEAR gpu=0.299ms cpu=1.928ms  6.44x
 U8 C1 up 3840x2160   LIN  gpu=0.346ms cpu=55.10ms 159.24x
 
-## ColorCvt (1280x720 N=1, 1 run)
-BGR2BGRA   (A)  gpu=0.0884ms cpu=0.982ms  11.1x
-BGR2RGB    (A)  gpu=0.1744ms cpu=1.194ms   6.8x
-BGR2GRAY   (B)  gpu=0.0743ms cpu=1.371ms  18.5x
-GRAY2BGR   (B)  gpu=0.0820ms cpu=1.771ms  21.6x
-BGR2YUV    (C)  gpu=0.1306ms cpu=5.435ms  41.6x
-YUV2BGR    (C)  gpu=0.1785ms cpu=4.427ms  24.8x
-BGR2HSV    (D) U8  gpu=0.1365ms cpu=10.339ms 75.8x
-BGR2HSV    (D) F32 gpu=0.1549ms cpu=14.826ms 95.7x
-HSV2BGR    (D)  gpu=0.1806ms cpu=5.167ms  28.6x
-YUV2BGR_NV12(E)  gpu=0.1311ms cpu=5.115ms  39.0x
-BGR2YUV_NV12(E)  gpu=0.0797ms cpu=2.939ms  36.9x
-YUV2GRAY_420(E)  gpu=0.0164ms cpu=0.071ms   4.3x
-YUV2BGR_YUY2(F)  gpu=0.0754ms cpu=5.546ms  73.5x
-YUV2GRAY_YUY2(F) gpu=0.0522ms cpu=0.247ms   4.7x
+## ColorCvt (1280x720 N=1, 1 run) — 2026-07-02 复跑
+BGR2BGRA   (A)  gpu=0.0828ms cpu=1.950ms  23.6x
+BGR2RGB    (A)  gpu=0.1524ms cpu=1.365ms   9.0x
+BGR2GRAY   (B)  gpu=0.0696ms cpu=1.378ms  19.8x
+GRAY2BGR   (B)  gpu=0.0703ms cpu=1.735ms  24.7x
+BGR2YUV    (C)  gpu=0.1329ms cpu=4.709ms  35.4x
+YUV2BGR    (C)  gpu=0.1784ms cpu=4.305ms  24.1x
+BGR2HSV    (D) U8  gpu=0.1358ms cpu=10.349ms 76.2x
+BGR2HSV    (D) F32 gpu=0.1560ms cpu=15.223ms 97.6x
+HSV2BGR    (D)  gpu=0.1807ms cpu=5.212ms  28.8x
+YUV2BGR_NV12(E)  gpu=0.1298ms cpu=5.111ms  39.4x
+BGR2YUV_NV12(E)  gpu=0.0796ms cpu=3.159ms  39.7x
+YUV2GRAY_420(E)  gpu=0.0172ms cpu=0.069ms   4.0x
+YUV2BGR_YUY2(F)  gpu=0.0754ms cpu=5.567ms  73.8x
+YUV2GRAY_YUY2(F) gpu=0.0523ms cpu=0.249ms   4.8x
 
 ## 说明
 - 诚实口径: CPU 参考是自写朴素单线程实现 (NMS/Normalize/ColorCvt 从 CV-CUDA
