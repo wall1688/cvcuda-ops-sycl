@@ -1,0 +1,79 @@
+# CPU↔GPU speedup 对比 — 2026-07-02 实测 (Intel Arc [0xb080])
+
+为回答"算子移植有没有做 CPU/GPU 对比验证", 给 6 个 cvcuda 算子的 profile
+测试加了 CPU gold 参考计时 (env 门控 VOX_CPUTIME=1, 默认关)。正确性 CPU↔GPU
+diff 早已有 (各自 *_gold.hpp / 自写 CPU 参考, 逐元素 mismatch + PASS/FAIL),
+本次只补 "GPU 比 CPU 快几倍" 的计时数。
+
+计时口径: CPU gold 单线程, std::chrono::steady_clock; 除 Normalize/Rotate
+best-of-3 外其余 1 次。speedup = cpu_ms / gpu_best_kernel_ms (SYCL event
+profiling, best-of-20)。运行: ONEAPI_DEVICE_SELECTOR=opencl:gpu VOX_PROFILE=1
+VOX_CPUTIME=1 ./test/test_<op>_profile
+
+正确性回归: 6 算子全 ALL TESTS PASSED (Resize 25+11=36, Remap 38+7=45,
+NMS/Normalize/Rotate 各自, ColorCvt 71 codes)。Resize/Remap gold 抽头重构
+后 bit-一致回归通过。
+
+## Normalize (N=64 H=128 W=128 C=4, F32, plain)
+gpu best_kernel=0.614 ms
+[CPU ref time: 4.381 ms, best-of-3]  speedup = 7.13x
+
+## Rotate (N=4 S=128 C=3, F32, LINEAR)
+gpu best_kernel=0.0495 ms
+[CPU ref time: 0.470 ms, best-of-3]  speedup = 9.50x
+
+## NMS (S=4 N=1000, SC=0.3 IOU=0.45) — gold O(S*N^2), 1 run
+gpu best_kernel=0.282 ms
+[CPU ref time: 10.638 ms, 1 run]  speedup = 37.73x
+(默认 N=5000 时 gold 单次约数十秒, 故用 N=1000 计时; A/B 比值同量级)
+
+## Remap (1920x1080 x4 batch, ABSOLUTE identity map, mapN=1, 1 run)
+f32c1 NEAR REPL  gpu=0.535ms  cpu= 63.37ms  speedup=118.50x
+f32c1 LIN  REPL  gpu=0.645ms  cpu= 75.64ms  speedup=117.22x
+f32c1 CUB  REPL  gpu=1.157ms  cpu=177.00ms  speedup=152.96x
+f32c1 LIN  REFL  gpu=0.761ms  cpu= 75.75ms  speedup= 99.58x
+f32c1 CUB  REFL  gpu=1.092ms  cpu=178.48ms  speedup=163.40x
+u8c4  NEAR REPL  gpu=0.693ms  cpu= 68.38ms  speedup= 98.64x
+u8c4  LIN  REPL  gpu=1.059ms  cpu=225.43ms  speedup=212.92x
+u8c4  CUB  REPL  gpu=1.748ms  cpu=410.34ms  speedup=234.73x
+
+## Resize (1920x1080 src, 1 run) — downscale 小图 launch-bound, GPU 仅略快
+F32 C1 down 960x540  NEAR gpu=0.128ms cpu=0.197ms  1.54x
+F32 C1 down 960x540  LIN  gpu=0.141ms cpu=0.196ms  1.39x
+F32 C1 down 960x540  CUB  gpu=0.132ms cpu=0.201ms  1.53x
+F32 C1 down 960x540  AREA gpu=0.133ms cpu=3.789ms  28.40x
+F32 C1 up 3840x2160  NEAR gpu=0.323ms cpu=3.148ms  9.75x
+F32 C1 up 3840x2160  LIN  gpu=0.357ms cpu=3.152ms  8.83x
+F32 C1 up 3840x2160  CUB  gpu=0.501ms cpu=3.152ms  6.29x
+U8 C3 down 960x540   NEAR gpu=0.116ms cpu=0.224ms  1.94x
+U8 C3 down 960x540   LIN  gpu=0.103ms cpu=7.888ms  76.49x
+U8 C3 down 960x540   AREA gpu=0.142ms cpu=9.916ms  69.69x
+U8 C3 up 3840x2160   NEAR gpu=1.282ms cpu=3.426ms  2.67x
+U8 C3 up 3840x2160   LIN  gpu=1.792ms cpu=132.00ms 73.66x
+U8 C1 up 3840x2160   NEAR gpu=0.299ms cpu=1.928ms  6.44x
+U8 C1 up 3840x2160   LIN  gpu=0.346ms cpu=55.10ms 159.24x
+
+## ColorCvt (1280x720 N=1, 1 run)
+BGR2BGRA   (A)  gpu=0.0884ms cpu=0.982ms  11.1x
+BGR2RGB    (A)  gpu=0.1744ms cpu=1.194ms   6.8x
+BGR2GRAY   (B)  gpu=0.0743ms cpu=1.371ms  18.5x
+GRAY2BGR   (B)  gpu=0.0820ms cpu=1.771ms  21.6x
+BGR2YUV    (C)  gpu=0.1306ms cpu=5.435ms  41.6x
+YUV2BGR    (C)  gpu=0.1785ms cpu=4.427ms  24.8x
+BGR2HSV    (D) U8  gpu=0.1365ms cpu=10.339ms 75.8x
+BGR2HSV    (D) F32 gpu=0.1549ms cpu=14.826ms 95.7x
+HSV2BGR    (D)  gpu=0.1806ms cpu=5.167ms  28.6x
+YUV2BGR_NV12(E)  gpu=0.1311ms cpu=5.115ms  39.0x
+BGR2YUV_NV12(E)  gpu=0.0797ms cpu=2.939ms  36.9x
+YUV2GRAY_420(E)  gpu=0.0164ms cpu=0.071ms   4.3x
+YUV2BGR_YUY2(F)  gpu=0.0754ms cpu=5.546ms  73.5x
+YUV2GRAY_YUY2(F) gpu=0.0522ms cpu=0.247ms   4.7x
+
+## 说明
+- 诚实口径: CPU 参考是自写朴素单线程实现 (NMS/Normalize/ColorCvt 从 CV-CUDA
+  独立 CPU 参考移植; Resize/Remap/Rotate 自写), 逐字照抄原版算法逻辑。非
+  NVIDIA GPU bit-diff (无 NVIDIA GPU/CUDA 工具链)。CPU 参考非优化基线,
+  speedup 数反映"GPU vs 朴素单线程 CPU"量级, 公平 GPU 性能对比见各算子
+  baseline->opt 优化记录。
+- 小图/低算力配置 (Resize downscale, ColorCvt gray 等) GPU launch-bound,
+  speedup 低 (1-7x) 是 GPU 固定 launch 开销主导, 属正常。

@@ -108,6 +108,16 @@ NVIDIA CV-CUDA 0.16.0 算子从 CUDA 移植到 Intel SYCL，目标平台 Intel A
 
 正确性测试采用「同算法 CPU 参考」自洽验证（GPU 输出 == 同算法 CPU 实现），**未与 NVIDIA CV-CUDA 二进制做 bit 级 diff**（需 NVIDIA GPU，未做）。CPU 参考逻辑移植自 CV-CUDA 自带的 gold（GoldNMS / CvtColorUtils / TestOpNormalize 等）或从原 `.cu` 逐行移植，kernel 与 gold 各自忠实两份原始实现，二者一致是较强的正确性证据。关键算法逻辑逐字照抄原版以降低理解错风险。详见各算子文档的「验证局限」章节。
 
+### CPU↔GPU 对比（正确性 + speedup）
+
+6 个算子均有 CPU↔GPU 正确性 diff（逐元素 mismatch + PASS/FAIL，见各 `test/test_*.cpp`）。此外各 `*_profile.cpp` 还可选地计时 CPU gold 参考并报告 GPU-vs-CPU speedup：
+
+```
+ONEAPI_DEVICE_SELECTOR=opencl:gpu VOX_PROFILE=1 VOX_CPUTIME=1 ./test/test_<op>_profile
+```
+
+`VOX_CPUTIME=1` 默认关闭（部分 config 的 CPU gold 单线程较慢）；开启后打印 `[CPU ref time: X ms]  speedup = Nx`。CPU 参考为朴素单线程实现，speedup 反映「GPU vs 朴素单线程 CPU」量级（非优化基线）。2026-07-02 实测数据见 `snapshots/cputime_2026-07-02/results.txt`（量级：Normalize 7×、Rotate 10×、NMS 38×、Remap 99-235×、Resize 1.4-159×、ColorCvt 4.3-95.7×；小图/低算力配置 GPU launch-bound 故 speedup 低）。
+
 ## 许可
 
 - 本仓库的移植代码（SYCL kernel、wrapper、测试）采用 MIT 许可（见 `LICENSE`）。
